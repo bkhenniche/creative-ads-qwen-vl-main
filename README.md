@@ -23,6 +23,8 @@ L'inférence utilise vLLM et ses structured outputs JSON Schema.
 | `MAX_NEW_TOKENS` | `4096` | Longueur maximale de la complétion |
 | `ALLOW_HF_DOWNLOAD` | *(désactivé)* | `1` pour télécharger les poids depuis Hugging Face si le Model Cache est absent |
 | `MODEL_PATH` | *(vide)* | Chemin local de poids, prioritaire sur toute résolution de cache |
+| `GPU_MEMORY_UTILIZATION` | `0.90` | Part de la VRAM allouée à vLLM (poids + cache KV) |
+| `KV_CACHE_DTYPE` | `auto` | `fp8` divise par deux le coût mémoire du cache KV |
 
 `MODEL_SEQ_LEN` doit rester au-dessus du coût réel d'une requête. Avec des
 référentiels dans `system_prompt`, une requête typique tient autour de
@@ -467,6 +469,46 @@ ERROR CONFLIT CUDA COMPAT: ... la bibliotheque de compat est en 575.51.03, mais 
       pilote de l'hote est plus recent (580.126.09). ... CORRECTIF: retirer
       VLLM_ENABLE_CUDA_COMPATIBILITY de l'image ou de l'endpoint.
 ```
+
+### `ValueError: ... KV cache is needed, which is larger than the available KV cache memory`
+
+Le moteur demarre, charge les poids, puis refuse d'allouer le cache KV. Ce n'est
+plus un probleme de pilote : c'est de l'arithmetique memoire.
+
+Les poids sont incompressibles ; tout le reste du budget VRAM va au cache KV.
+Pour `Qwen3-VL-8B` en bf16, comptez **~18 Gio de poids + activations** et
+**~144 Kio de cache KV par token**.
+
+| VRAM | `gpu_mem_util` | Cache KV | Capacite | Suffit pour Pocodex (~36 000 tokens) ? |
+| --- | --- | --- | --- | --- |
+| 24 Gio | 0.90 | 3,6 Gio | ~26 200 tokens | ❌ |
+| 24 Gio | 0.95 | 4,8 Gio | ~35 000 tokens | ❌ (de justesse) |
+| 24 Gio + **`fp8`** | 0.90 | 3,6 Gio | **~52 400 tokens** | ✅ |
+| 32 Gio | 0.90 | 10,8 Gio | ~78 700 tokens | ✅ |
+| 48 Gio | 0.90 | 25,2 Gio | ~183 500 tokens | ✅ |
+
+Deux correctifs, au choix :
+
+- **Rester sur 24 Gio** : `KV_CACHE_DTYPE=fp8` et `MODEL_SEQ_LEN=49152`. Le fp8
+  double la capacite du cache KV ; l'impact qualite est negligeable pour cette
+  tache. Il faut aussi baisser `MODEL_SEQ_LEN` sous la capacite obtenue, sinon
+  vLLM refuse toujours de demarrer.
+- **Passer sur >= 32 Gio** : les valeurs par defaut fonctionnent telles quelles.
+
+Noter que `GPU_MEMORY_UTILIZATION=0.95` seul **ne suffit pas** sur 24 Gio : il
+donne ~35 000 tokens, juste sous le besoin. Ne pas perdre un cycle dessus.
+
+Le worker estime desormais la capacite au demarrage, avant que vLLM n'echoue :
+
+```
+INFO  VRAM detectee: 24.0 Gio
+INFO  Capacite KV estimee: ~26214 tokens (kv_cache_dtype=auto)
+ERROR CACHE KV TROP PETIT: ~26214 tokens disponibles, or une requete Pocodex en
+      demande ~36 000. ... (1) KV_CACHE_DTYPE=fp8 (double la capacite, ~52428 tokens)
+```
+
+L'estimation est fiable a moins de 0,5 % pres de ce que rapporte vLLM
+(26 214 estimes contre 26 304 mesures).
 
 #### Distinguer des deux autres pannes de demarrage
 

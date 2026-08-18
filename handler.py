@@ -49,6 +49,10 @@ MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "4096"))
 # Referentials in the system prompt push a request well past 32k tokens.
 MAX_MODEL_LEN = int(os.environ.get("MODEL_SEQ_LEN", "65536"))
 MAX_IMAGES = int(os.environ.get("MAX_IMAGES", "64"))
+GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.90"))
+# "fp8" divise par deux le cout memoire du cache KV: indispensable pour tenir
+# MODEL_SEQ_LEN sur une carte de 24 Go (voir README, section KV cache).
+KV_CACHE_DTYPE = os.environ.get("KV_CACHE_DTYPE", "auto").strip() or "auto"
 # Qwen3-VL bills roughly one visual token per 32x32 px after patch merging.
 IMAGE_MIN_PIXELS = int(os.environ.get("IMAGE_MIN_PIXELS", 4 * 32 * 32))
 IMAGE_MAX_PIXELS = int(os.environ.get("IMAGE_MAX_PIXELS", 400 * 32 * 32))
@@ -101,7 +105,8 @@ def log_gpu_environment():
 
     try:
         probe = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"],
+            ["nvidia-smi", "--query-gpu=name,driver_version,memory.total",
+             "--format=csv,noheader"],
             capture_output=True, text=True, timeout=20,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -117,10 +122,18 @@ def log_gpu_environment():
 
     rows = [r.strip() for r in probe.stdout.strip().splitlines() if r.strip()]
     driver = None
+    vram_mib = None
     for row in rows:
         LOGGER.info("GPU: %s (CUDA de l'image: %s)", row, image_cuda or "inconnue")
-        if driver is None and "," in row:
-            driver = row.split(",")[-1].strip()
+        fields = [f.strip() for f in row.split(",")]
+        if driver is None and len(fields) >= 2:
+            driver = fields[1]
+        if vram_mib is None and len(fields) >= 3:
+            digits = "".join(c for c in fields[2] if c.isdigit())
+            if digits:
+                vram_mib = int(digits)
+
+    warn_kv_budget(vram_mib)
 
     if not (driver and image_cuda):
         return
@@ -144,6 +157,61 @@ def log_gpu_environment():
                     driver, required, image_cuda)
 
     check_cuda_compat(driver)
+
+
+def warn_kv_budget(vram_mib):
+    """Prevenir avant que vLLM ne bute sur le cache KV.
+
+    Le poids du modele est fixe; tout le reste du budget va au cache KV. Pour
+    Qwen3-VL-8B en bf16 (~18 Gio residents), une carte de 24 Go ne laisse que
+    ~3,6 Gio de KV, soit ~26 000 tokens - insuffisant pour un prompt Pocodex
+    d'environ 36 000 tokens. kv_cache_dtype=fp8 double cette capacite.
+    """
+    if not vram_mib:
+        return
+    vram_gib = vram_mib / 1024
+    LOGGER.info("VRAM detectee: %.1f Gio", vram_gib)
+
+    # ~18 Gio de poids + activations pour un 8B bf16, ~144 Kio/token de KV.
+    weights_gib = 18.0
+    kv_gib = vram_gib * GPU_MEMORY_UTILIZATION - weights_gib
+    if kv_gib <= 0:
+        LOGGER.error(
+            "VRAM insuffisante (%.1f Gio) pour charger le modele: augmenter la "
+            "taille du GPU.", vram_gib)
+        return
+
+    per_token_gib = 144.0 / (1024 * 1024)
+    if KV_CACHE_DTYPE.startswith("fp8"):
+        per_token_gib /= 2
+    capacity = int(kv_gib / per_token_gib)
+    LOGGER.info("Capacite KV estimee: ~%d tokens (kv_cache_dtype=%s)",
+                capacity, KV_CACHE_DTYPE)
+
+    if capacity >= MAX_MODEL_LEN:
+        return
+
+    # Un prompt Pocodex = ~31 k de referentiels + ~5 k d'images + la completion.
+    needed = 40960
+    suggested = (capacity // 1024) * 1024
+
+    if capacity >= needed:
+        LOGGER.warning(
+            "MODEL_SEQ_LEN=%d depasse la capacite KV (~%d tokens) et vLLM va "
+            "refuser de demarrer, mais la carte suffit pour Pocodex "
+            "(~36 000 tokens par requete). CORRECTIF: MODEL_SEQ_LEN=%d.",
+            MAX_MODEL_LEN, capacity, suggested)
+        return
+
+    hint = ("KV_CACHE_DTYPE=fp8 (double la capacite, ~%d tokens) "
+            % (capacity * 2)) if not KV_CACHE_DTYPE.startswith("fp8") else ""
+    LOGGER.error(
+        "CACHE KV TROP PETIT: ~%d tokens disponibles, or une requete Pocodex "
+        "en demande ~36 000. vLLM va refuser de demarrer. CORRECTIFS, par "
+        "ordre de preference: (1) %s; (2) passer sur un GPU >= 32 Gio; "
+        "(3) GPU_MEMORY_UTILIZATION=0.95 (gain marginal, insuffisant seul sur "
+        "24 Gio). Puis fixer MODEL_SEQ_LEN sous la capacite obtenue.",
+        capacity, hint or "augmenter la VRAM")
 
 
 def check_cuda_compat(driver):
@@ -295,8 +363,9 @@ def load_model_once():
     origin = "Hugging Face" if model_path == CACHE_MODEL_ID else model_path
     LOGGER.info(
         "Chargement de %s depuis %s (max_model_len=%d, max_images=%d, "
-        "offline=%s)",
+        "gpu_mem_util=%.2f, kv_cache_dtype=%s, offline=%s)",
         CACHE_MODEL_ID, origin, MAX_MODEL_LEN, MAX_IMAGES,
+        GPU_MEMORY_UTILIZATION, KV_CACHE_DTYPE,
         os.environ.get("HF_HUB_OFFLINE"),
     )
 
@@ -311,7 +380,8 @@ def load_model_once():
         tensor_parallel_size=1,
         max_model_len=MAX_MODEL_LEN,
         max_num_seqs=1,
-        gpu_memory_utilization=0.90,
+        gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
+        kv_cache_dtype=KV_CACHE_DTYPE,
         limit_mm_per_prompt={"image": MAX_IMAGES, "video": 1},
         enable_prefix_caching=True,
         mm_processor_cache_gb=0,
