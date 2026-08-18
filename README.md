@@ -21,6 +21,8 @@ L'inférence utilise vLLM et ses structured outputs JSON Schema.
 | `IMAGE_MAX_PIXELS` | `409600` (400×32×32) | Budget de pixels par frame, ~400 tokens visuels |
 | `IMAGE_MIN_PIXELS` | `4096` (4×32×32) | Plancher de pixels par frame |
 | `MAX_NEW_TOKENS` | `4096` | Longueur maximale de la complétion |
+| `ALLOW_HF_DOWNLOAD` | *(désactivé)* | `1` pour télécharger les poids depuis Hugging Face si le Model Cache est absent |
+| `MODEL_PATH` | *(vide)* | Chemin local de poids, prioritaire sur toute résolution de cache |
 
 `MODEL_SEQ_LEN` doit rester au-dessus du coût réel d'une requête. Avec des
 référentiels dans `system_prompt`, une requête typique tient autour de
@@ -385,6 +387,70 @@ Coût mesuré sur un spot de 12 s : 16 frames en 768 px, corps de requête
   `MODEL_SEQ_LEN`.
 - Les erreurs de validation ou d'inférence gardent le même en-tête de contrat et
   renvoient `status: "error"` avec `error.code` et `error.message`.
+
+## Dépannage
+
+### `Le Model Cache RunPod ne contient pas ... sous /runpod-volume/huggingface-cache/hub`
+
+Le worker démarre puis sort en `exit code 1` : il ne trouve pas les poids. Le
+Model Cache est une propriété **de l'endpoint**, pas de l'image — un endpoint
+recréé, ou un second endpoint pointant sur la même image, repart sans cache.
+
+L'erreur liste désormais ce qui est réellement monté :
+
+```
+Le Model Cache RunPod ne contient pas Qwen/Qwen3-VL-8B-Instruct sous /runpod-volume/huggingface-cache/hub.
+  /runpod-volume n'existe pas: aucun Network Volume n'est monte sur cet endpoint.
+  Corrections possibles:
+    1. Configurer le Model Cache de l'endpoint ...
+```
+
+Deux cas se distinguent immédiatement :
+
+- **`/runpod-volume n'existe pas`** — l'endpoint n'a ni Model Cache ni Network
+  Volume. C'est le cas courant sur un endpoint fraîchement créé.
+- **`Modeles presents dans le cache: [...]`** — le volume est bien là mais
+  contient un autre modèle ; comparer avec `MODEL_NAME`.
+
+**Correctif recommandé.** Sur la page de l'endpoint RunPod, renseigner le modèle
+Hugging Face `Qwen/Qwen3-VL-8B-Instruct` dans le Model Cache, puis redéployer.
+RunPod pré-télécharge les poids sous
+`/runpod-volume/huggingface-cache/hub/models--Qwen--Qwen3-VL-8B-Instruct/` avant
+le démarrage des workers, et le chargement reste hors ligne.
+
+**Contournement.** `ALLOW_HF_DOWNLOAD=1` fait télécharger les poids depuis
+Hugging Face au démarrage : le worker boote sans Model Cache, au prix d'un
+premier démarrage à froid long (~16 Go) répété à chaque worker neuf. Utile pour
+débloquer un test, à ne pas garder en production.
+
+`MODEL_PATH` court-circuite toute la résolution et pointe directement un dossier
+de poids — utile pour un Network Volume rempli à la main.
+
+### `CUDA error 803: system has unsupported display driver / cuda driver combination`
+
+Le modèle se charge, puis `EngineCore failed to start` et le worker sort en
+`exit code 1`. Ce n'est pas un bug du handler : le pilote NVIDIA **de la machine
+hôte** est plus ancien que le runtime CUDA de l'image.
+
+L'image de base est `vllm/vllm-openai:v0.26.0-x86_64-cu129-ubuntu2404`, donc
+**CUDA 12.9**, qui exige un pilote Linux **≥ 575.51.03**. Un worker attribué sur
+un hôte en 5xx plus ancien échoue systématiquement, et RunPod le relance en
+boucle sur le même hôte.
+
+**Correctif.** Sur l'endpoint RunPod, section *Advanced* → filtre **CUDA
+Version** : cocher **12.9 et toutes les versions supérieures**. CUDA est
+rétro-compatible, donc sélectionner la version requise *et* les suivantes
+maximise le nombre d'hôtes éligibles tout en excluant ceux dont le pilote est
+trop ancien. Sans ce filtre, l'attribution est aléatoire et l'endpoint échoue
+par intermittence.
+
+**Alternative.** Reconstruire sur une image `cu128` (CUDA 12.8, pilote ≥ 570.26)
+ou `cu126` (≥ 560.28.03) : le parc compatible s'élargit, au prix d'un runtime
+CUDA plus ancien. Utile si le filtre 12.9 laisse trop peu de GPU disponibles.
+
+Ce symptôme se distingue nettement du précédent : ici le chemin du modèle est
+résolu et vLLM démarre — l'échec survient à `init_device()`, pas au chargement
+des poids.
 
 Références : [Qwen3-VL — Process Videos](https://github.com/QwenLM/Qwen3-VL#process-videos),
 [vLLM — Structured Outputs](https://docs.vllm.ai/en/latest/features/structured_outputs),

@@ -9,8 +9,20 @@ from pathlib import Path
 import tempfile
 from urllib.parse import urlparse
 
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+def _flag(name):
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# Opt-in escape hatch: pull the weights from Hugging Face when the RunPod Model
+# Cache is not configured on this endpoint. Slow first cold start, but it beats
+# a worker that cannot boot. Must be decided before transformers/vllm import.
+ALLOW_HF_DOWNLOAD = _flag("ALLOW_HF_DOWNLOAD")
+if ALLOW_HF_DOWNLOAD:
+    os.environ["HF_HUB_OFFLINE"] = "0"
+    os.environ["TRANSFORMERS_OFFLINE"] = "0"
+else:
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("FORCE_QWENVL_VIDEO_READER", "torchcodec")
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
@@ -73,7 +85,39 @@ def error_response(code, message, raw_text=None):
     return response
 
 
+def describe_cache():
+    """What is actually on the volume — the missing half of the old error."""
+    lines = []
+    volume = Path("/runpod-volume")
+    if not volume.is_dir():
+        return ["  /runpod-volume n'existe pas: aucun Network Volume n'est "
+                "monte sur cet endpoint."]
+    if not CACHE_ROOT.is_dir():
+        lines.append(f"  {CACHE_ROOT} n'existe pas.")
+        try:
+            top = sorted(e.name for e in volume.iterdir())[:20]
+            lines.append(f"  Contenu de /runpod-volume: {top or '(vide)'}")
+        except OSError as exc:
+            lines.append(f"  /runpod-volume illisible: {exc}")
+        return lines
+    try:
+        found = sorted(e.name for e in CACHE_ROOT.iterdir() if e.name.startswith("models--"))
+    except OSError as exc:
+        return [f"  {CACHE_ROOT} illisible: {exc}"]
+    lines.append(f"  Modeles presents dans le cache ({len(found)}): "
+                 f"{found or '(aucun)'}")
+    return lines
+
+
 def resolve_snapshot_path(model_id):
+    # An explicit path wins over everything else.
+    override = os.environ.get("MODEL_PATH", "").strip()
+    if override:
+        if not Path(override).is_dir():
+            raise RuntimeError(f"MODEL_PATH={override} n'est pas un dossier.")
+        LOGGER.info("MODEL_PATH force le chemin du modele: %s", override)
+        return override
+
     try:
         organisation, name = model_id.split("/", 1)
     except ValueError as exc:
@@ -93,22 +137,41 @@ def resolve_snapshot_path(model_id):
         if snapshots:
             return str(snapshots[0])
 
+    if ALLOW_HF_DOWNLOAD:
+        LOGGER.warning(
+            "%s absent du Model Cache; telechargement depuis Hugging Face "
+            "(ALLOW_HF_DOWNLOAD=1). Le premier demarrage a froid sera long.",
+            model_id,
+        )
+        return model_id
+
+    diagnostic = "\n".join(describe_cache())
     raise RuntimeError(
-        f"Le Model Cache RunPod ne contient pas {model_id} sous {CACHE_ROOT}."
+        f"Le Model Cache RunPod ne contient pas {model_id} sous {CACHE_ROOT}.\n"
+        f"{diagnostic}\n"
+        "  Corrections possibles:\n"
+        f"    1. Configurer le Model Cache de l'endpoint sur {model_id} "
+        "(RunPod: endpoint > Model (Hugging Face)), puis redeployer.\n"
+        "    2. Definir MODEL_NAME sur un modele deja present dans le cache.\n"
+        "    3. Definir ALLOW_HF_DOWNLOAD=1 pour telecharger depuis Hugging "
+        "Face au demarrage (cold start long, necessite le reseau).\n"
+        "    4. Definir MODEL_PATH sur un dossier de poids local."
     )
 
 
 def load_model_once():
     model_path = resolve_snapshot_path(CACHE_MODEL_ID)
+    origin = "Hugging Face" if model_path == CACHE_MODEL_ID else model_path
     LOGGER.info(
-        "Chargement de %s avec vLLM depuis le Model Cache "
-        "(max_model_len=%d, max_images=%d)",
-        CACHE_MODEL_ID, MAX_MODEL_LEN, MAX_IMAGES,
+        "Chargement de %s depuis %s (max_model_len=%d, max_images=%d, "
+        "offline=%s)",
+        CACHE_MODEL_ID, origin, MAX_MODEL_LEN, MAX_IMAGES,
+        os.environ.get("HF_HUB_OFFLINE"),
     )
 
     processor = AutoProcessor.from_pretrained(
         model_path,
-        local_files_only=True,
+        local_files_only=not ALLOW_HF_DOWNLOAD,
     )
     engine = LLM(
         model=model_path,
