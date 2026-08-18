@@ -428,43 +428,60 @@ de poids — utile pour un Network Volume rempli à la main.
 
 ### `CUDA error 803: system has unsupported display driver / cuda driver combination`
 
-Le modèle se charge, puis `EngineCore failed to start` et le worker sort en
-`exit code 1`. Ce n'est pas un bug du handler : le pilote NVIDIA **de la machine
-hôte** est plus ancien que le runtime CUDA de l'image.
+Le modèle se charge, `EngineCore failed to start`, le worker sort en `exit code 1`.
 
-L'image de base est `vllm/vllm-openai:v0.26.0-x86_64-cu129-ubuntu2404`, donc
-**CUDA 12.9**, qui exige un pilote Linux **≥ 575.51.03**. Un worker attribué sur
-un hôte en 5xx plus ancien échoue systématiquement, et RunPod le relance en
-boucle sur le même hôte.
+**Cause reelle, constatee sur cet endpoint : `VLLM_ENABLE_CUDA_COMPATIBILITY=1`.**
+Ce n'est *pas* un pilote trop ancien.
 
-**Il n'existe pas d'échappatoire côté image.** Toutes les images officielles
-`vllm/vllm-openai`, de `v0.20.0` à `v0.26.0`, sont publiées en **cu129
-uniquement** (v0.20.0 ajoute cu130). Aucune variante `cu128` ou `cu126` n'est
-disponible : descendre de version de vLLM ne descend pas la version de CUDA. Le
-correctif est donc nécessairement côté RunPod.
+Ce drapeau demande a vLLM de charger les bibliotheques de **forward
+compatibility** CUDA livrees dans `/usr/local/cuda*/compat/`. Elles existent pour
+faire tourner un CUDA recent sur un pilote **ancien**. Le NVIDIA Container
+Toolkit, lui, injecte deja dans le conteneur le `libcuda.so` exact de l'hote.
+Quand le drapeau est actif, le `libcuda.so` de compat **masque** celui de
+l'hote ; si le pilote de l'hote est plus **recent** que la bibliotheque de
+compat, le module noyau refuse la combinaison et `cudaGetDeviceCount()` remonte
+`CUDA_ERROR_SYSTEM_DRIVER_MISMATCH` (803).
 
-**Correctif 1 — filtre CUDA.** Endpoint → *Advanced* → **CUDA Version** :
-cocher **12.9 et 13.0**. Sans ce filtre l'attribution est aléatoire et l'endpoint
-échoue par intermittence. Vérifier que le réglage est bien enregistré et
-l'endpoint redéployé.
+Le diagnostic est contre-intuitif : **plus le pilote de l'hote est recent, plus
+l'echec est certain**. Resserrer le filtre CUDA de l'endpoint sur 12.9/13.0 —
+donc obtenir des pilotes 575/580 — aggrave le probleme au lieu de le resoudre.
 
-**Correctif 2 — changer de type de GPU.** C'est souvent le levier décisif. Les
-pools A6000 / A40 sont d'anciennes cartes Ampere, fréquemment restées sur une
-branche de pilote 5xx antérieure à 575. Les pools plus récents (L40S, L4, RTX
-4090/5090, H100) sont bien plus souvent à jour. Un modèle 8B en bf16 tient
-largement sur 24–48 Go, donc le choix reste ouvert.
-
-**Diagnostic.** Le worker journalise désormais le GPU et le pilote **avant**
-d'initialiser vLLM :
+Trace observee, ou le pilote est manifestement sain :
 
 ```
-INFO  GPU: NVIDIA RTX A6000, 550.54.14 (CUDA de l'image: 12.9)
-ERROR PILOTE TROP ANCIEN: l'hote est en 550.54.14, or CUDA 12.9 exige >= 575.51.03.
+GPU: NVIDIA RTX PRO 6000 Blackwell Server Edition, 580.126.09 (CUDA de l'image: 12.9)
+Pilote 580.126.09 >= 575.51.03 requis pour CUDA 12.9: OK.
+...
+RuntimeError: ... Error 803: system has unsupported display driver / cuda driver combination
 ```
 
-Cette ligne apparaît en quelques secondes, au lieu d'attendre ~30 s de chargement
-pour un `CUDA error 803` illisible. Elle permet de vérifier immédiatement si le
-filtre CUDA fait effet, et sur quels pilotes tombent réellement les workers.
+**Correctif : retirer `VLLM_ENABLE_CUDA_COMPATIBILITY` de l'image et de
+l'endpoint.** Il a ete supprime du `Dockerfile`. Ne l'activer qu'au runtime, au
+cas par cas, sur un hote dont le pilote est reellement trop ancien.
+
+Le worker detecte desormais ce piege au demarrage :
+
+```
+INFO  Bibliotheque CUDA compat presente: /usr/local/cuda-12.9/compat/libcuda.so.575.51.03
+ERROR CONFLIT CUDA COMPAT: ... la bibliotheque de compat est en 575.51.03, mais le
+      pilote de l'hote est plus recent (580.126.09). ... CORRECTIF: retirer
+      VLLM_ENABLE_CUDA_COMPATIBILITY de l'image ou de l'endpoint.
+```
+
+#### Distinguer des deux autres pannes de demarrage
+
+| Symptome | Cause | Correctif |
+| --- | --- | --- |
+| `Le Model Cache RunPod ne contient pas ...` | L'endpoint n'a pas de Model Cache | Configurer le Model Cache de l'endpoint |
+| Erreur **35** `CUDA driver version is insufficient` | Pilote reellement trop ancien | Filtre CUDA Version de l'endpoint |
+| Erreur **803** `display driver / cuda driver combination` | Bibliotheques de compat qui masquent le libcuda de l'hote | Retirer `VLLM_ENABLE_CUDA_COMPATIBILITY` |
+
+CUDA distingue les deux derniers cas : un pilote **trop ancien** produit l'erreur
+**35** (`cudaErrorInsufficientDriver`), pas la 803. Voir une 803 est donc en
+soi un indice qu'il s'agit d'un conflit de bibliotheques, pas d'une question de
+version.
+
+Pour reference, les pilotes minimaux par version de CUDA de l'image :
 
 | CUDA de l'image | Pilote minimal |
 | --- | --- |
@@ -472,10 +489,6 @@ filtre CUDA fait effet, et sur quels pilotes tombent réellement les workers.
 | 12.9 | 575.51.03 |
 | 12.8 | 570.26 |
 | 12.6 | 560.28.03 |
-
-Ce symptôme se distingue nettement du précédent : ici le chemin du modèle est
-résolu et vLLM démarre — l'échec survient à `init_device()`, pas au chargement
-des poids.
 
 Références : [Qwen3-VL — Process Videos](https://github.com/QwenLM/Qwen3-VL#process-videos),
 [vLLM — Structured Outputs](https://docs.vllm.ai/en/latest/features/structured_outputs),

@@ -143,6 +143,61 @@ def log_gpu_environment():
         LOGGER.info("Pilote %s >= %s requis pour CUDA %s: OK.",
                     driver, required, image_cuda)
 
+    check_cuda_compat(driver)
+
+
+def check_cuda_compat(driver):
+    """Detecte le piege de la *forward compatibility* CUDA.
+
+    /usr/local/cuda*/compat/ contient un libcuda.so prevu pour faire tourner un
+    CUDA recent sur un pilote ANCIEN. Si VLLM_ENABLE_CUDA_COMPATIBILITY le fait
+    charger alors que le pilote de l'hote est plus RECENT, il masque le libcuda
+    injecte par le NVIDIA Container Toolkit et CUDA remonte l'erreur 803, alors
+    meme que le pilote est parfaitement valide.
+    """
+    compat_version = None
+    for root in sorted(Path("/usr/local").glob("cuda*/compat")):
+        for lib in sorted(root.glob("libcuda.so.*")):
+            candidate = lib.name.replace("libcuda.so.", "")
+            if candidate and candidate[0].isdigit():
+                compat_version = candidate
+                LOGGER.info("Bibliotheque CUDA compat presente: %s (%s)",
+                            lib, candidate)
+
+    enabled = _flag("VLLM_ENABLE_CUDA_COMPATIBILITY")
+    if not enabled:
+        if compat_version:
+            LOGGER.info(
+                "VLLM_ENABLE_CUDA_COMPATIBILITY non active: le libcuda de "
+                "l'hote sera utilise. C'est le reglage correct ici."
+            )
+        return
+
+    if not (driver and compat_version):
+        LOGGER.warning(
+            "VLLM_ENABLE_CUDA_COMPATIBILITY est actif mais la comparaison des "
+            "versions est impossible; en cas d'erreur 803, desactiver ce "
+            "drapeau en premier."
+        )
+        return
+
+    if _version_tuple(driver) >= _version_tuple(compat_version):
+        LOGGER.error(
+            "CONFLIT CUDA COMPAT: VLLM_ENABLE_CUDA_COMPATIBILITY est actif, la "
+            "bibliotheque de compat est en %s, mais le pilote de l'hote est "
+            "plus recent (%s). Le libcuda de compat va masquer celui de "
+            "l'hote et CUDA echouera en erreur 803, bien que le pilote soit "
+            "valide. CORRECTIF: retirer VLLM_ENABLE_CUDA_COMPATIBILITY de "
+            "l'image ou de l'endpoint. Ce drapeau ne sert que sur un hote au "
+            "pilote TROP ANCIEN.",
+            compat_version, driver,
+        )
+    else:
+        LOGGER.info(
+            "VLLM_ENABLE_CUDA_COMPATIBILITY actif; compat %s > pilote %s, "
+            "usage legitime.", compat_version, driver,
+        )
+
 
 class InputError(ValueError):
     pass
