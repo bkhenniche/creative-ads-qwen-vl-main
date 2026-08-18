@@ -22,16 +22,23 @@ from vllm import LLM, SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
 
 
-SCHEMA_VERSION = "1.0"
-MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
-CACHE_MODEL_ID = os.environ.get("MODEL_NAME", MODEL_ID)
+SCHEMA_VERSION = "1.1"
+DEFAULT_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
+# MODEL_NAME overrides both the Model Cache lookup and what we report back.
+MODEL_ID = os.environ.get("MODEL_NAME", DEFAULT_MODEL_ID)
+CACHE_MODEL_ID = MODEL_ID
 CACHE_ROOT = Path(
     os.environ.get(
         "RUNPOD_HF_CACHE_ROOT", "/runpod-volume/huggingface-cache/hub"
     )
 )
-MAX_NEW_TOKENS = 4096
-MAX_MODEL_LEN = 32768
+MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "4096"))
+# Referentials in the system prompt push a request well past 32k tokens.
+MAX_MODEL_LEN = int(os.environ.get("MODEL_SEQ_LEN", "65536"))
+MAX_IMAGES = int(os.environ.get("MAX_IMAGES", "64"))
+# Qwen3-VL bills roughly one visual token per 32x32 px after patch merging.
+IMAGE_MIN_PIXELS = int(os.environ.get("IMAGE_MIN_PIXELS", 4 * 32 * 32))
+IMAGE_MAX_PIXELS = int(os.environ.get("IMAGE_MAX_PIXELS", 400 * 32 * 32))
 VIDEO_FPS = 1.0
 VIDEO_MIN_PIXELS = 4 * 32 * 32
 VIDEO_MAX_PIXELS = 256 * 32 * 32
@@ -93,7 +100,11 @@ def resolve_snapshot_path(model_id):
 
 def load_model_once():
     model_path = resolve_snapshot_path(CACHE_MODEL_ID)
-    LOGGER.info("Chargement de %s avec vLLM depuis le Model Cache", CACHE_MODEL_ID)
+    LOGGER.info(
+        "Chargement de %s avec vLLM depuis le Model Cache "
+        "(max_model_len=%d, max_images=%d)",
+        CACHE_MODEL_ID, MAX_MODEL_LEN, MAX_IMAGES,
+    )
 
     processor = AutoProcessor.from_pretrained(
         model_path,
@@ -107,7 +118,8 @@ def load_model_once():
         max_model_len=MAX_MODEL_LEN,
         max_num_seqs=1,
         gpu_memory_utilization=0.90,
-        limit_mm_per_prompt={"image": 64, "video": 1},
+        limit_mm_per_prompt={"image": MAX_IMAGES, "video": 1},
+        enable_prefix_caching=True,
         mm_processor_cache_gb=0,
         seed=0,
         enforce_eager=True,
@@ -188,6 +200,11 @@ def validate_input(job):
 
     validate_response_schema(payload.get("response_schema"))
 
+    for key in ("image_min_pixels", "image_max_pixels"):
+        value = payload.get(key)
+        if value is not None and (not isinstance(value, int) or value <= 0):
+            raise InputError(f"input.{key} doit être un entier positif.")
+
     frames = payload.get("frames")
     video_url = payload.get("video_url")
     video_base64 = payload.get("video_base64")
@@ -205,6 +222,11 @@ def validate_input(job):
         )
 
     if isinstance(frames, list) and frames:
+        if len(frames) > MAX_IMAGES:
+            raise InputError(
+                f"input.frames contient {len(frames)} images; "
+                f"le worker en accepte {MAX_IMAGES} au maximum."
+            )
         images = [decode_frame(frame, index) for index, frame in enumerate(frames)]
         return payload, "frames", images
 
@@ -225,10 +247,20 @@ def add_optional_system_message(messages, payload):
 
 
 def build_frame_messages(payload, images):
+    min_pixels = payload.get("image_min_pixels") or IMAGE_MIN_PIXELS
+    max_pixels = payload.get("image_max_pixels") or IMAGE_MAX_PIXELS
+
     content = []
     for frame, image in zip(payload["frames"], images):
         content.append({"type": "text", "text": f"frame_id: {frame['id']}"})
-        content.append({"type": "image", "image": image})
+        content.append(
+            {
+                "type": "image",
+                "image": image,
+                "min_pixels": min_pixels,
+                "max_pixels": max_pixels,
+            }
+        )
     content.append({"type": "text", "text": payload["prompt"].strip()})
 
     messages = []
@@ -323,7 +355,20 @@ def generate_text(messages, response_schema):
     )
     if not outputs or not outputs[0].outputs:
         raise RuntimeError("vLLM n'a produit aucune complétion.")
-    return outputs[0].outputs[0].text.strip()
+
+    output = outputs[0]
+    completion = output.outputs[0]
+    usage = {
+        "prompt_tokens": len(getattr(output, "prompt_token_ids", None) or []),
+        "completion_tokens": len(getattr(completion, "token_ids", None) or []),
+        "max_model_len": MAX_MODEL_LEN,
+    }
+    # Present on the vLLM V1 engine; the prefix cache is what makes a static
+    # system prompt (referentials) cheap on every call after the first.
+    cached = getattr(output, "num_cached_tokens", None)
+    if isinstance(cached, int):
+        usage["cached_prompt_tokens"] = cached
+    return completion.text.strip(), usage
 
 
 def extract_first_json_object(text):
@@ -363,11 +408,27 @@ def handler(job):
     try:
         if source_mode == "frames":
             messages = build_frame_messages(payload, source)
-            raw_text = generate_text(messages, response_schema)
+            raw_text, usage = generate_text(messages, response_schema)
         else:
             with video_reference(source_mode, source) as video_source:
                 messages = build_video_messages(payload, video_source)
-                raw_text = generate_text(messages, response_schema)
+                raw_text, usage = generate_text(messages, response_schema)
+    except ValueError as exc:
+        message = str(exc)
+        if "maximum" in message and "token" in message.lower():
+            LOGGER.error("Contexte dépassé: %s", message)
+            return error_response(
+                "CONTEXT_LENGTH_EXCEEDED",
+                "La requête dépasse max_model_len "
+                f"({MAX_MODEL_LEN}). Réduire le nombre d'images, "
+                "image_max_pixels ou la taille du system_prompt, "
+                "ou augmenter MODEL_SEQ_LEN.",
+            )
+        LOGGER.exception("Échec de l'inférence Qwen3-VL avec vLLM")
+        return error_response(
+            "INFERENCE_FAILED",
+            "L'inférence Qwen3-VL avec vLLM a échoué; voir les logs.",
+        )
     except Exception:
         LOGGER.exception("Échec de l'inférence Qwen3-VL avec vLLM")
         return error_response(
@@ -388,6 +449,8 @@ def handler(job):
         "model": MODEL_ID,
         "engine": "vllm",
         "status": "success",
+        "source": source_mode,
+        "usage": usage,
         "raw_text": raw_text,
     }
     if context is not None:

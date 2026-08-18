@@ -11,6 +11,22 @@ L'inférence utilise vLLM et ses structured outputs JSON Schema.
 - GPU : A6000 ou A40, 48 Go, un GPU par worker
 - Timeout d'exécution : 300 s
 
+### Variables d'environnement
+
+| Variable | Défaut | Rôle |
+| --- | --- | --- |
+| `MODEL_NAME` | `Qwen/Qwen3-VL-8B-Instruct` | Snapshot résolu dans le Model Cache **et** modèle annoncé dans la réponse |
+| `MODEL_SEQ_LEN` | `65536` | `max_model_len` de vLLM |
+| `MAX_IMAGES` | `64` | Plafond de `input.frames` et `limit_mm_per_prompt` |
+| `IMAGE_MAX_PIXELS` | `409600` (400×32×32) | Budget de pixels par frame, ~400 tokens visuels |
+| `IMAGE_MIN_PIXELS` | `4096` (4×32×32) | Plancher de pixels par frame |
+| `MAX_NEW_TOKENS` | `4096` | Longueur maximale de la complétion |
+
+`MODEL_SEQ_LEN` doit rester au-dessus du coût réel d'une requête. Avec des
+référentiels dans `system_prompt`, une requête typique tient autour de
+**36 000 tokens** (≈31 000 pour le prompt système, ≈324 tokens par frame en
+768 px) : les 32 768 d'origine étaient insuffisants.
+
 Le build ne copie et ne télécharge aucun poids. Au démarrage, le handler
 résout exclusivement le snapshot présent dans le Model Cache RunPod sous
 `/runpod-volume/huggingface-cache/hub`, puis charge le modèle une seule fois en
@@ -24,6 +40,8 @@ vient de l'appel :
 - `prompt` : chaîne non vide, obligatoire ;
 - `system_prompt` : chaîne non vide, facultative ;
 - `response_schema` : JSON Schema de type `object`, facultatif ;
+- `image_min_pixels` / `image_max_pixels` : entiers positifs, facultatifs,
+  budget de pixels par frame (mode `frames` uniquement) ;
 - exactement une source parmi `video_base64`, `video_url` et `frames`.
 
 Pour `video_base64`, `mime_type` accepte `video/mp4`, `video/quicktime` ou
@@ -39,14 +57,27 @@ Réponse applicative réussie :
 
 ```json
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "model": "Qwen/Qwen3-VL-8B-Instruct",
   "engine": "vllm",
   "status": "success",
+  "source": "frames",
+  "usage": {
+    "prompt_tokens": 36121,
+    "completion_tokens": 148,
+    "cached_prompt_tokens": 30937,
+    "max_model_len": 65536
+  },
   "raw_text": "{\"brand_name\":\"Marie\"}",
   "context": {"brand_name": "Marie"}
 }
 ```
+
+`usage` sert à deux contrôles. `prompt_tokens` face à `max_model_len` donne la
+marge restante avant `CONTEXT_LENGTH_EXCEEDED`. `cached_prompt_tokens` mesure le
+préfixe réutilisé par le cache vLLM : sur la deuxième requête d'un worker chaud
+partageant le même `system_prompt`, il doit couvrir tout ce prompt système. S'il
+reste à zéro, le préfixe n'est pas identique au bit près.
 
 Sans schéma, une réponse textuelle reste un succès dans `raw_text`. Si elle
 contient un objet JSON, celui-ci est aussi exposé dans `context`. Avec un schéma,
@@ -287,6 +318,55 @@ Frames déjà extraites :
 }
 ```
 
+## Mode `frames` avec référentiels — usage Pocodex
+
+C'est le mode recommandé pour la labellisation publicitaire : on choisit les
+images envoyées au lieu de subir un échantillonnage uniforme, et on met les
+référentiels dans `system_prompt` pour qu'ils soient mis en cache.
+
+**1. Choisir les frames.** Le créatif occupe exactement `[0, D)` puis ~1 s de
+noir ; `ffmpeg blackdetect` donne `D` sans modèle. Le packshot de fin porte la
+marque dans la quasi-totalité des cas, donc on répartit les images sur le corps
+du film **et on en force deux dans `[D-3s, D-0.3s]`** :
+
+```python
+D = first_black_start(path)                      # 12.0 s
+body    = [0.3 + i * (D - 3.3) / 13 for i in range(14)]
+endcard = [D - 2.0, D - 0.6]
+stamps  = sorted(body + endcard)
+```
+
+Extraction en 768 px, désentrelacée — la source est du 1080**i** et le peignage
+dégrade la lecture du texte :
+
+```bash
+ffmpeg -ss "$T" -i in.mxf -frames:v 1 -vf "yadif,scale=768:-2" -q:v 6 out.jpg
+```
+
+**2. Nommer les frames.** `id` est réinjecté tel quel dans le prompt sous la
+forme `frame_id: <id>`, juste avant l'image. Des identifiants parlants
+(`14_endcard_t10.00`) permettent au prompt de renvoyer vers le packshot sans
+autre mécanisme.
+
+**3. Mettre les référentiels dans `system_prompt`.** Le message système est
+émis avant les images, donc son préfixe est stable d'un appel à l'autre et vLLM
+le réutilise via son cache de préfixe (actif par défaut). Trois conditions :
+
+- préfixe identique **au bit près** — un tri instable, un espace ou un saut de
+  ligne en trop suffit à invalider le cache ; générer le bloc une fois comme
+  artefact de build ;
+- rien de variable avant lui — la durée du spot et l'horodatage vont dans
+  `prompt`, jamais dans `system_prompt` ;
+- worker chaud — un démarrage à froid paie le préfixe une fois.
+
+**4. Contraindre la sortie.** `response_schema` est transmis à
+`StructuredOutputsParams(json=...)`. Les codes doivent être des `enum` du schéma :
+un code à 4 lettres est exactement ce qu'un modèle invente de façon plausible, et
+`BYDF` contre `BYDD` est invisible en texte libre.
+
+Coût mesuré sur un spot de 12 s : 16 frames en 768 px, corps de requête
+**1,08 Mo**, ~36 100 tokens dont ~30 900 de référentiels réutilisables.
+
 ## Limites importantes
 
 - Le traitement vidéo suit le flux officiel Qwen3-VL :
@@ -296,7 +376,13 @@ Frames déjà extraites :
   transcription audio doit être produite séparément puis fournie dans le prompt.
 - RunPod limite le corps de `/run` à 10 Mo et celui de `/runsync` à 20 Mo. Le
   Base64 augmente la taille d'environ un tiers ; utilisez `video_url` pour les
-  vidéos plus volumineuses.
+  vidéos plus volumineuses. Un MXF de diffusion brut est hors de portée : 233 Mo
+  deviennent 310 Mo en Base64. En mode `frames`, 16 images en 768 px tiennent en
+  ~0,9 Mo.
+- Une requête trop longue renvoie l'erreur applicative
+  `CONTEXT_LENGTH_EXCEEDED` plutôt qu'un échec générique. Réduire le nombre
+  d'images, `image_max_pixels` ou le prompt système, ou augmenter
+  `MODEL_SEQ_LEN`.
 - Les erreurs de validation ou d'inférence gardent le même en-tête de contrat et
   renvoient `status: "error"` avec `error.code` et `error.message`.
 
