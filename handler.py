@@ -6,6 +6,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 from urllib.parse import urlparse
 
@@ -66,6 +67,81 @@ PROCESSOR = None
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 LOGGER = logging.getLogger("qwen3-vl-worker")
+
+
+# Pilote NVIDIA minimal par version de CUDA embarquee dans l'image.
+MIN_DRIVER_FOR_CUDA = {
+    "13.0": "580.65.06",
+    "12.9": "575.51.03",
+    "12.8": "570.26",
+    "12.6": "560.28.03",
+    "12.4": "550.54.14",
+}
+
+
+def _version_tuple(text):
+    parts = []
+    for chunk in str(text).split("."):
+        digits = "".join(c for c in chunk if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def log_gpu_environment():
+    """Journalise GPU et pilote avant d'initialiser vLLM.
+
+    Sans cela, un pilote hote trop ancien ne se manifeste qu'apres ~30 s de
+    chargement, sous la forme d'un CUDA error 803 illisible.
+    """
+    try:
+        import torch
+        image_cuda = torch.version.cuda
+    except Exception:
+        image_cuda = None
+
+    try:
+        probe = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        LOGGER.warning("nvidia-smi indisponible (%s); pilote hote inconnu.", exc)
+        return
+
+    if probe.returncode != 0:
+        LOGGER.warning(
+            "nvidia-smi a echoue (rc=%s): %s",
+            probe.returncode, (probe.stderr or "").strip()[:300],
+        )
+        return
+
+    rows = [r.strip() for r in probe.stdout.strip().splitlines() if r.strip()]
+    driver = None
+    for row in rows:
+        LOGGER.info("GPU: %s (CUDA de l'image: %s)", row, image_cuda or "inconnue")
+        if driver is None and "," in row:
+            driver = row.split(",")[-1].strip()
+
+    if not (driver and image_cuda):
+        return
+
+    required = MIN_DRIVER_FOR_CUDA.get(image_cuda)
+    if not required:
+        return
+
+    if _version_tuple(driver) < _version_tuple(required):
+        LOGGER.error(
+            "PILOTE TROP ANCIEN: l'hote est en %s, or CUDA %s exige >= %s. "
+            "Le demarrage de vLLM va echouer avec 'CUDA error 803'. "
+            "Corriger cote RunPod: filtre CUDA Version de l'endpoint sur %s et "
+            "au-dessus, et/ou changer de type de GPU (les pools recents sont "
+            "plus souvent a jour). Aucune image vLLM officielle n'est publiee "
+            "pour une version de CUDA plus ancienne.",
+            driver, image_cuda, required, image_cuda,
+        )
+    else:
+        LOGGER.info("Pilote %s >= %s requis pour CUDA %s: OK.",
+                    driver, required, image_cuda)
 
 
 class InputError(ValueError):
@@ -522,5 +598,6 @@ def handler(job):
 
 
 if __name__ == "__main__":
+    log_gpu_environment()
     ENGINE, PROCESSOR = load_model_once()
     runpod.serverless.start({"handler": handler})

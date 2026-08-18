@@ -437,16 +437,41 @@ L'image de base est `vllm/vllm-openai:v0.26.0-x86_64-cu129-ubuntu2404`, donc
 un hôte en 5xx plus ancien échoue systématiquement, et RunPod le relance en
 boucle sur le même hôte.
 
-**Correctif.** Sur l'endpoint RunPod, section *Advanced* → filtre **CUDA
-Version** : cocher **12.9 et toutes les versions supérieures**. CUDA est
-rétro-compatible, donc sélectionner la version requise *et* les suivantes
-maximise le nombre d'hôtes éligibles tout en excluant ceux dont le pilote est
-trop ancien. Sans ce filtre, l'attribution est aléatoire et l'endpoint échoue
-par intermittence.
+**Il n'existe pas d'échappatoire côté image.** Toutes les images officielles
+`vllm/vllm-openai`, de `v0.20.0` à `v0.26.0`, sont publiées en **cu129
+uniquement** (v0.20.0 ajoute cu130). Aucune variante `cu128` ou `cu126` n'est
+disponible : descendre de version de vLLM ne descend pas la version de CUDA. Le
+correctif est donc nécessairement côté RunPod.
 
-**Alternative.** Reconstruire sur une image `cu128` (CUDA 12.8, pilote ≥ 570.26)
-ou `cu126` (≥ 560.28.03) : le parc compatible s'élargit, au prix d'un runtime
-CUDA plus ancien. Utile si le filtre 12.9 laisse trop peu de GPU disponibles.
+**Correctif 1 — filtre CUDA.** Endpoint → *Advanced* → **CUDA Version** :
+cocher **12.9 et 13.0**. Sans ce filtre l'attribution est aléatoire et l'endpoint
+échoue par intermittence. Vérifier que le réglage est bien enregistré et
+l'endpoint redéployé.
+
+**Correctif 2 — changer de type de GPU.** C'est souvent le levier décisif. Les
+pools A6000 / A40 sont d'anciennes cartes Ampere, fréquemment restées sur une
+branche de pilote 5xx antérieure à 575. Les pools plus récents (L40S, L4, RTX
+4090/5090, H100) sont bien plus souvent à jour. Un modèle 8B en bf16 tient
+largement sur 24–48 Go, donc le choix reste ouvert.
+
+**Diagnostic.** Le worker journalise désormais le GPU et le pilote **avant**
+d'initialiser vLLM :
+
+```
+INFO  GPU: NVIDIA RTX A6000, 550.54.14 (CUDA de l'image: 12.9)
+ERROR PILOTE TROP ANCIEN: l'hote est en 550.54.14, or CUDA 12.9 exige >= 575.51.03.
+```
+
+Cette ligne apparaît en quelques secondes, au lieu d'attendre ~30 s de chargement
+pour un `CUDA error 803` illisible. Elle permet de vérifier immédiatement si le
+filtre CUDA fait effet, et sur quels pilotes tombent réellement les workers.
+
+| CUDA de l'image | Pilote minimal |
+| --- | --- |
+| 13.0 | 580.65.06 |
+| 12.9 | 575.51.03 |
+| 12.8 | 570.26 |
+| 12.6 | 560.28.03 |
 
 Ce symptôme se distingue nettement du précédent : ici le chemin du modèle est
 résolu et vLLM démarre — l'échec survient à `init_device()`, pas au chargement
