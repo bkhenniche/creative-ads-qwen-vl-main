@@ -20,7 +20,7 @@ L'inférence utilise vLLM et ses structured outputs JSON Schema.
 | `MAX_IMAGES` | `64` | Plafond de `input.frames` et `limit_mm_per_prompt` |
 | `IMAGE_MAX_PIXELS` | `409600` (400×32×32) | Budget de pixels par frame, ~400 tokens visuels |
 | `IMAGE_MIN_PIXELS` | `4096` (4×32×32) | Plancher de pixels par frame |
-| `MAX_NEW_TOKENS` | `4096` | Longueur maximale de la complétion |
+| `MAX_NEW_TOKENS` | `800` | Longueur maximale de la complétion (surchargeable par `input.max_tokens`) |
 | `ALLOW_HF_DOWNLOAD` | *(désactivé)* | `1` pour télécharger les poids depuis Hugging Face si le Model Cache est absent |
 | `MODEL_PATH` | *(vide)* | Chemin local de poids, prioritaire sur toute résolution de cache |
 | `GPU_MEMORY_UTILIZATION` | `0.90` | Part de la VRAM allouée à vLLM (poids + cache KV) |
@@ -388,7 +388,9 @@ Coût mesuré sur un spot de 12 s : 16 frames en 768 px, corps de requête
   d'images, `image_max_pixels` ou le prompt système, ou augmenter
   `MODEL_SEQ_LEN`.
 - Les erreurs de validation ou d'inférence gardent le même en-tête de contrat et
-  renvoient `status: "error"` avec `error.code` et `error.message`.
+  renvoient `status: "error"` avec `error_code` et `error_message`, deux
+  **chaines**. La cle `error` de premier niveau est volontairement inutilisee :
+  elle est reservee par le SDK runpod (voir Dépannage).
 
 ## Dépannage
 
@@ -469,6 +471,58 @@ ERROR CONFLIT CUDA COMPAT: ... la bibliotheque de compat est en 575.51.03, mais 
       pilote de l'hote est plus recent (580.126.09). ... CORRECTIF: retirer
       VLLM_ENABLE_CUDA_COMPATIBILITY de l'image ou de l'endpoint.
 ```
+
+### `MODEL_OUTPUT_TRUNCATED` : le modèle boucle et tronque son JSON
+
+Le modèle repète la même phrase dans un champ texte libre jusqu'à épuiser son
+budget de tokens ; le JSON n'est jamais refermé et devient illisible. Observé sur
+un `industry_evidence` de ~15 000 caractères, 4 096 tokens consommés en 173 s.
+
+Le décodage contraint garantit la *structure*, pas la *longueur* du contenu
+d'une chaîne : sans borne, une boucle reste possible.
+
+**Correctifs, complémentaires :**
+
+- **Côté client, le vrai correctif** : `maxLength` sur chaque champ texte libre
+  du `response_schema`. XGrammar l'applique, la boucle devient impossible.
+- **Côté worker** : `MAX_NEW_TOKENS` passe de 4096 à **800**, et
+  `input.max_tokens` permet de le surcharger par requête.
+- L'erreur `MODEL_OUTPUT_TRUNCATED` distingue ce cas de
+  `MODEL_OUTPUT_INVALID_JSON` : levée quand `finish_reason == "length"`.
+  `usage.finish_reason` est remonté dans toutes les réponses.
+
+### `Failed to return job results. | 400, message='Bad Request'` sur `/job-done`
+
+Le worker demarre, traite le job (`Started.` / `Finished.`), mais le resultat
+n'arrive jamais : RunPod refuse le POST vers `/job-done` en **400**, le job est
+remis en file et rejoue indefiniment.
+
+**Cause : la cle `error` de premier niveau du dictionnaire retourne.** Le SDK
+runpod (>= 1.7) se la reserve et n'accepte qu'une **chaine**. Le handler y
+renvoyait un dict `{"code": ..., "message": ...}` ; le POST de resultat devient
+alors invalide et echoue en 400.
+
+L'effet est pervers : **toutes les erreurs applicatives devenaient invisibles**.
+Le chemin nominal passait, mais la moindre erreur — entree invalide, contexte
+depasse, JSON non conforme — disparaissait dans un 400 suivi d'un rejeu, sans
+jamais atteindre le client.
+
+**Correctif applique.** `error_response()` n'utilise plus la cle reservee :
+
+```json
+{
+  "status": "error",
+  "error_code": "INVALID_INPUT",
+  "error_message": "input.prompt est requis."
+}
+```
+
+Les erreurs sont aussi journalisees en `ERROR` cote worker, donc visibles dans
+les logs RunPod meme si la reponse se perd.
+
+**A retenir pour la suite** : ne jamais placer de structure sous `error` au
+premier niveau de la valeur retournee par le handler. Pour les rappels de
+limites, `/run` accepte 10 Mo et `/runsync` 20 Mo, en entree comme en sortie.
 
 ### `ValueError: ... KV cache is needed, which is larger than the available KV cache memory`
 

@@ -45,7 +45,9 @@ CACHE_ROOT = Path(
         "RUNPOD_HF_CACHE_ROOT", "/runpod-volume/huggingface-cache/hub"
     )
 )
-MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "4096"))
+# 4096 laissait une boucle de repetition tourner ~170 s avant de tronquer le
+# JSON. Une reponse conforme au schema Pocodex tient largement sous 800.
+MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "800"))
 # Referentials in the system prompt push a request well past 32k tokens.
 MAX_MODEL_LEN = int(os.environ.get("MODEL_SEQ_LEN", "65536"))
 MAX_IMAGES = int(os.environ.get("MAX_IMAGES", "64"))
@@ -272,12 +274,22 @@ class InputError(ValueError):
 
 
 def error_response(code, message, raw_text=None):
+    """Erreur applicative, renvoyee dans output avec le job en COMPLETED.
+
+    NE PAS utiliser la cle "error" au premier niveau: le SDK runpod se la
+    reserve et n'accepte qu'une CHAINE. Y mettre un dict fait echouer le POST
+    vers /job-done en "400 Bad Request", le resultat est perdu et le job est
+    rejoue - donc toutes les erreurs deviennent invisibles cote client.
+    On expose donc error_code / error_message, tous deux des chaines.
+    """
+    LOGGER.error("Erreur applicative %s: %s", code, message)
     response = {
         "schema_version": SCHEMA_VERSION,
         "model": MODEL_ID,
         "engine": "vllm",
         "status": "error",
-        "error": {"code": code, "message": message},
+        "error_code": str(code),
+        "error_message": str(message),
     }
     if raw_text is not None:
         response["raw_text"] = raw_text
@@ -464,6 +476,10 @@ def validate_input(job):
 
     validate_response_schema(payload.get("response_schema"))
 
+    max_tokens = payload.get("max_tokens")
+    if max_tokens is not None and (not isinstance(max_tokens, int) or max_tokens <= 0):
+        raise InputError("input.max_tokens doit être un entier positif.")
+
     for key in ("image_min_pixels", "image_max_pixels"):
         value = payload.get(key)
         if value is not None and (not isinstance(value, int) or value <= 0):
@@ -599,12 +615,12 @@ def prepare_vllm_input(messages):
     }
 
 
-def generate_text(messages, response_schema):
+def generate_text(messages, response_schema, max_tokens=None):
     request = prepare_vllm_input(messages)
     sampling_kwargs = {
         "temperature": 0.0,
         "top_k": -1,
-        "max_tokens": MAX_NEW_TOKENS,
+        "max_tokens": max_tokens or MAX_NEW_TOKENS,
         "seed": 0,
     }
     if response_schema is not None:
@@ -626,6 +642,8 @@ def generate_text(messages, response_schema):
         "prompt_tokens": len(getattr(output, "prompt_token_ids", None) or []),
         "completion_tokens": len(getattr(completion, "token_ids", None) or []),
         "max_model_len": MAX_MODEL_LEN,
+        # "length" = budget epuise, donc sortie tronquee: le JSON sera invalide.
+        "finish_reason": getattr(completion, "finish_reason", None),
     }
     # Present on the vLLM V1 engine; the prefix cache is what makes a static
     # system prompt (referentials) cheap on every call after the first.
@@ -672,11 +690,13 @@ def handler(job):
     try:
         if source_mode == "frames":
             messages = build_frame_messages(payload, source)
-            raw_text, usage = generate_text(messages, response_schema)
+            raw_text, usage = generate_text(
+                messages, response_schema, payload.get("max_tokens"))
         else:
             with video_reference(source_mode, source) as video_source:
                 messages = build_video_messages(payload, video_source)
-                raw_text, usage = generate_text(messages, response_schema)
+                raw_text, usage = generate_text(
+                    messages, response_schema, payload.get("max_tokens"))
     except ValueError as exc:
         message = str(exc)
         if "maximum" in message and "token" in message.lower():
@@ -702,10 +722,19 @@ def handler(job):
 
     context = parse_context(raw_text, structured=response_schema is not None)
     if response_schema is not None and context is None:
+        if usage.get("finish_reason") == "length":
+            return error_response(
+                "MODEL_OUTPUT_TRUNCATED",
+                f"Le modele a epuise son budget de {usage['completion_tokens']} "
+                "tokens avant de fermer le JSON, souvent a cause d'une boucle "
+                "de repetition dans un champ libre. Bornez les champs texte du "
+                "schema avec maxLength, et/ou relevez input.max_tokens.",
+                raw_text=raw_text[:2000],
+            )
         return error_response(
             "MODEL_OUTPUT_INVALID_JSON",
             "vLLM n'a pas retourné un objet conforme au schéma demandé.",
-            raw_text=raw_text,
+            raw_text=raw_text[:2000],
         )
 
     response = {
