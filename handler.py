@@ -495,11 +495,16 @@ def validate_input(job):
             isinstance(video_base64, str) and bool(video_base64),
         )
     )
-    if selected_sources != 1:
+    if selected_sources > 1:
         raise InputError(
-            "Fournir exactement une source: input.frames, input.video_url "
+            "Fournir au plus une source: input.frames, input.video_url "
             "ou input.video_base64."
         )
+    if selected_sources == 0:
+        # Mode texte seul: pas de media. Utilise par l'etape 2 de Pocodex, qui
+        # choisit une feuille de nomenclature a partir de la description
+        # produite par l'etape 1.
+        return payload, "text", None
 
     if isinstance(frames, list) and frames:
         if len(frames) > MAX_IMAGES:
@@ -546,6 +551,19 @@ def build_frame_messages(payload, images):
     messages = []
     add_optional_system_message(messages, payload)
     messages.append({"role": "user", "content": content})
+    return messages
+
+
+def build_text_messages(payload):
+    messages = []
+    add_optional_system_message(messages, payload)
+    # Liste de parties, comme le mode frames, et non une chaine nue: c'est la
+    # forme que process_vision_info parcourt deja. Sans media elle renvoie
+    # (None, None, {}) et prepare_vllm_input omet multi_modal_data.
+    messages.append(
+        {"role": "user", "content": [{"type": "text",
+                                      "text": payload["prompt"].strip()}]}
+    )
     return messages
 
 
@@ -603,16 +621,14 @@ def prepare_vllm_input(messages):
         multi_modal_data["image"] = image_inputs
     if video_inputs is not None:
         multi_modal_data["video"] = video_inputs
-    if not multi_modal_data:
-        raise RuntimeError("qwen-vl-utils n'a produit aucun média visuel.")
 
-    processor_kwargs = dict(video_kwargs or {})
-    processor_kwargs["do_resize"] = False
-    return {
-        "prompt": text,
-        "multi_modal_data": multi_modal_data,
-        "mm_processor_kwargs": processor_kwargs,
-    }
+    request = {"prompt": text}
+    if multi_modal_data:
+        processor_kwargs = dict(video_kwargs or {})
+        processor_kwargs["do_resize"] = False
+        request["multi_modal_data"] = multi_modal_data
+        request["mm_processor_kwargs"] = processor_kwargs
+    return request
 
 
 def generate_text(messages, response_schema, max_tokens=None):
@@ -690,6 +706,10 @@ def handler(job):
     try:
         if source_mode == "frames":
             messages = build_frame_messages(payload, source)
+            raw_text, usage = generate_text(
+                messages, response_schema, payload.get("max_tokens"))
+        elif source_mode == "text":
+            messages = build_text_messages(payload)
             raw_text, usage = generate_text(
                 messages, response_schema, payload.get("max_tokens"))
         else:

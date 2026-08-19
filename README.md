@@ -5,7 +5,10 @@ Worker Queue-based pour analyser une vidéo ou une série d'images avec
 L'inférence utilise vLLM et ses structured outputs JSON Schema.
 
 - Endpoint déployé : `creative-ads-qwen-vl`
-- Endpoint ID : `lfc5g5t8u3p9bk`
+- Endpoint ID : **`gygc665isz9s8y`** — l'ancien `lfc5g5t8u3p9bk` n'existe plus et
+  renvoie `401 unauthorized access to endpoint` (la clé est valide, elle
+  n'atteint pas cet endpoint). Un ID d'endpoint change dès qu'on le recrée :
+  vérifier avec `label_spot.py --check`, qui liste ceux que la clé voit.
 - Image de base : `vllm/vllm-openai:v0.26.0-x86_64-cu129-ubuntu2404`
 - Model Cache RunPod : `Qwen/Qwen3-VL-8B-Instruct`
 - GPU : A6000 ou A40, 48 Go, un GPU par worker
@@ -46,7 +49,11 @@ vient de l'appel :
 - `response_schema` : JSON Schema de type `object`, facultatif ;
 - `image_min_pixels` / `image_max_pixels` : entiers positifs, facultatifs,
   budget de pixels par frame (mode `frames` uniquement) ;
-- exactement une source parmi `video_base64`, `video_url` et `frames`.
+- **au plus une** source parmi `video_base64`, `video_url` et `frames` : deux
+  sources sont refusées, **zéro est légal** et déclenche une complétion
+  texte seul (utilisée par l'étape 2 de Pocodex, qui choisit une feuille de
+  nomenclature à partir d'une description, sans revoir les images) ;
+- `max_tokens` : entier positif, facultatif, surcharge `MAX_NEW_TOKENS`.
 
 Pour `video_base64`, `mime_type` accepte `video/mp4`, `video/quicktime` ou
 `video/webm`. Pour `frames`, chaque entrée contient `id`, `mime_type` et
@@ -153,7 +160,7 @@ Ne stockez jamais la clé API dans le dépôt :
 
 ```bash
 export RUNPOD_API_KEY="<RUNPOD_API_KEY>"
-export ENDPOINT_ID="lfc5g5t8u3p9bk"
+export ENDPOINT_ID="gygc665isz9s8y"
 ```
 
 Santé de l'endpoint :
@@ -364,20 +371,41 @@ le réutilise via son cache de préfixe (actif par défaut). Trois conditions :
 - worker chaud — un démarrage à froid paie le préfixe une fois.
 
 **4. Contraindre la sortie.** `response_schema` est transmis à
-`StructuredOutputsParams(json=...)`. Les codes doivent être des `enum` du schéma :
-un code à 4 lettres est exactement ce qu'un modèle invente de façon plausible, et
-`BYDF` contre `BYDD` est invisible en texte libre.
+`StructuredOutputsParams(json=...)`. Deux règles apprises en production :
 
-Coût mesuré sur un spot de 12 s : 16 frames en 768 px, corps de requête
-**1,08 Mo**, ~36 100 tokens dont ~30 900 de référentiels réutilisables.
+- **`enum` sur les *noms*, pas sur les codes.** Un `enum` garantit une valeur
+  *valide*, pas la *bonne* : le premier vrai run a renvoyé `BAYA` — code
+  parfaitement valide, celui de BAYARD — tout en écrivant le libellé `BAYER`. Le
+  modèle produit fiablement le bon **nom** et non fiablement le bon **code** ;
+  le client dérive donc le code à partir du nom.
+- **`maxLength` sur chaque champ texte libre**, sinon une boucle de répétition
+  épuise le budget de tokens et tronque le JSON.
+
+**5. Découper en deux appels.** Le vrai problème n'est pas la perception mais la
+recherche d'une ligne parmi 1 453 de référentiels noyées dans 40 000 tokens.
+D'où deux appels :
+
+| | Prompt | Contenu |
+| --- | --- | --- |
+| Étape A | ~11 400 tok | instructions + 763 **noms** d'annonceurs + 28 familles + 16 frames |
+| Étape B | 432–4 397 tok (médiane ~1 070) | feuilles de la famille retenue + description produite par A. **Sans images** — mode texte seul |
+
+Coût mesuré sur un spot de 12 s : corps de requête **0,99 Mo** pour l'étape A,
+**~12 400 tokens au total** contre **45 137 mesurés** pour l'ancien appel unique,
+soit **3,6× moins**. Le client de référence est
+`pocodex/scripts/label_spot.py`.
 
 ## Limites importantes
 
 - Le traitement vidéo suit le flux officiel Qwen3-VL :
   `return_video_kwargs=True`, `return_video_metadata=True`, `do_resize=False`,
   échantillonnage à 1 fps et budgets de pixels bornés.
-- Le worker analyse uniquement les images de la vidéo, pas sa piste audio. Une
-  transcription audio doit être produite séparément puis fournie dans le prompt.
+- Le worker analyse uniquement les images de la vidéo, pas sa piste audio
+  (Qwen3-VL est vision seule ; l'audio, c'est Qwen3-**Omni**). Une transcription
+  doit être produite séparément puis fournie dans le prompt.
+- Le décodage contraint garantit la **structure**, pas la **longueur** du contenu
+  d'une chaîne. Borner chaque champ texte libre du schéma avec `maxLength`, sans
+  quoi une boucle de répétition tronque le JSON (voir Dépannage).
 - RunPod limite le corps de `/run` à 10 Mo et celui de `/runsync` à 20 Mo. Le
   Base64 augmente la taille d'environ un tiers ; utilisez `video_url` pour les
   vidéos plus volumineuses. Un MXF de diffusion brut est hors de portée : 233 Mo
@@ -393,6 +421,26 @@ Coût mesuré sur un spot de 12 s : 16 frames en 768 px, corps de requête
   elle est reservee par le SDK runpod (voir Dépannage).
 
 ## Dépannage
+
+Cinq pannes distinctes ont été rencontrées et résolues. Elles se ressemblent dans
+les logs, d'où cette table de tri : le symptôme utile est **où** le worker meurt.
+
+| Symptôme | Cause | Correctif |
+| --- | --- | --- |
+| `Le Model Cache RunPod ne contient pas ...` | L'endpoint n'a pas de Model Cache (c'est un réglage **de l'endpoint**, pas de l'image) | Renseigner le modèle HF sur l'endpoint |
+| `CUDA error 803` à `init_device()` | `VLLM_ENABLE_CUDA_COMPATIBILITY=1` : les libs de forward-compat masquent le `libcuda` de l'hôte | Retirer ce drapeau — **pas** un pilote trop ancien |
+| `ValueError: ... KV cache ... larger than available` | Poids + `MODEL_SEQ_LEN` dépassent la VRAM | `KV_CACHE_DTYPE=fp8`, ou GPU ≥ 32 Gio |
+| `Failed to return job results \| 400` sur `/job-done` | Un dict sous la clé réservée `error` ; le SDK n'accepte qu'une chaîne | `error_code` / `error_message` — sinon **toutes** les erreurs deviennent invisibles |
+| `MODEL_OUTPUT_TRUNCATED` | Boucle de répétition dans un champ texte libre | `maxLength` dans le schéma + `MAX_NEW_TOKENS` borné |
+
+Distinction utile : un pilote réellement **trop ancien** produit l'erreur CUDA
+**35** (`cudaErrorInsufficientDriver`), jamais la **803**. Voir une 803 est donc
+en soi l'indice d'un conflit de bibliothèques, pas d'un problème de version.
+
+Le worker journalise GPU, pilote, VRAM, capacité KV estimée et présence des libs
+de compat **avant** d'initialiser vLLM, ce qui rend ces cas lisibles en quelques
+secondes au lieu d'attendre ~30 s pour une trace CUDA opaque.
+
 
 ### `Le Model Cache RunPod ne contient pas ... sous /runpod-volume/huggingface-cache/hub`
 
