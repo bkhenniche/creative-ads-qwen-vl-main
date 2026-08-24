@@ -13,7 +13,6 @@ from urllib.parse import urlparse
 def _flag(name):
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
-
 # Opt-in escape hatch: pull the weights from Hugging Face when the RunPod Model
 # Cache is not configured on this endpoint. Slow first cold start, but it beats
 # a worker that cannot boot. Must be decided before transformers/vllm import.
