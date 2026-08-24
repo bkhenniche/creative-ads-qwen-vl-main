@@ -34,6 +34,11 @@ from transformers import AutoProcessor
 from vllm import LLM, SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
 
+try:                       # nom et emplacement stables depuis vLLM 0.11
+    from vllm.config import StructuredOutputsConfig
+except ImportError:        # variante ancienne: LLM() accepte aussi un dict
+    StructuredOutputsConfig = None
+
 
 SCHEMA_VERSION = "1.1"
 DEFAULT_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
@@ -67,6 +72,16 @@ VIDEO_SUFFIXES = {
     "video/quicktime": ".mov",
     "video/webm": ".webm",
 }
+
+# Voir load_model_once(). DISABLE_JSON_WHITESPACE=0 pour revenir au comportement
+# d'origine, uniquement pour reproduire le bug.
+_NO_WS = os.environ.get("DISABLE_JSON_WHITESPACE", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+if StructuredOutputsConfig is not None:
+    STRUCTURED_OUTPUTS_CONFIG = StructuredOutputsConfig(
+        disable_any_whitespace=_NO_WS)
+else:
+    STRUCTURED_OUTPUTS_CONFIG = {"disable_any_whitespace": _NO_WS}
 
 ENGINE = None
 PROCESSOR = None
@@ -375,10 +390,11 @@ def load_model_once():
     origin = "Hugging Face" if model_path == CACHE_MODEL_ID else model_path
     LOGGER.info(
         "Chargement de %s depuis %s (max_model_len=%d, max_images=%d, "
-        "gpu_mem_util=%.2f, kv_cache_dtype=%s, offline=%s)",
+        "gpu_mem_util=%.2f, kv_cache_dtype=%s, offline=%s, "
+        "disable_any_whitespace=%s)",
         CACHE_MODEL_ID, origin, MAX_MODEL_LEN, MAX_IMAGES,
         GPU_MEMORY_UTILIZATION, KV_CACHE_DTYPE,
-        os.environ.get("HF_HUB_OFFLINE"),
+        os.environ.get("HF_HUB_OFFLINE"), _NO_WS,
     )
 
     processor = AutoProcessor.from_pretrained(
@@ -396,6 +412,16 @@ def load_model_once():
         kv_cache_dtype=KV_CACHE_DTYPE,
         limit_mm_per_prompt={"image": MAX_IMAGES, "video": 1},
         enable_prefix_caching=True,
+        # LE correctif de la boucle d'espaces. La grammaire JSON de XGrammar
+        # autorise une quantite arbitraire d'espaces entre les jetons; le modele
+        # peut donc emettre un prefixe valide puis boucler sur des sauts de
+        # ligne jusqu'a epuiser max_tokens, en produisant 41 caracteres utiles
+        # pour 1200 jetons. Constate sur les trois etapes, a tous les budgets:
+        # relever le plafond ne fait qu'augmenter la facture (~15 c/spot contre
+        # 1,3 c). Bug vLLM connu (issue #19945): sur le moteur V1 ce reglage
+        # n'est lisible QUE depuis la config du moteur, pas depuis
+        # SamplingParams -- le passer par requete ne fait rien.
+        structured_outputs_config=STRUCTURED_OUTPUTS_CONFIG,
         mm_processor_cache_gb=0,
         seed=0,
         enforce_eager=True,
@@ -654,12 +680,18 @@ def generate_text(messages, response_schema, max_tokens=None):
 
     output = outputs[0]
     completion = output.outputs[0]
+    # .strip() plus bas masquait entierement le bug: 41 caracteres restants
+    # pour 1200 jetons consommes. On mesure donc l'ecart avant de nettoyer.
+    raw_len = len(completion.text or "")
     usage = {
         "prompt_tokens": len(getattr(output, "prompt_token_ids", None) or []),
         "completion_tokens": len(getattr(completion, "token_ids", None) or []),
         "max_model_len": MAX_MODEL_LEN,
         # "length" = budget epuise, donc sortie tronquee: le JSON sera invalide.
         "finish_reason": getattr(completion, "finish_reason", None),
+        # Un ecart important entre les deux = generation d'espaces.
+        "completion_chars": raw_len,
+        "completion_chars_stripped": len((completion.text or "").strip()),
     }
     # Present on the vLLM V1 engine; the prefix cache is what makes a static
     # system prompt (referentials) cheap on every call after the first.

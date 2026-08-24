@@ -24,6 +24,7 @@ L'inférence utilise vLLM et ses structured outputs JSON Schema.
 | `IMAGE_MAX_PIXELS` | `409600` (400×32×32) | Budget de pixels par frame, ~400 tokens visuels |
 | `IMAGE_MIN_PIXELS` | `4096` (4×32×32) | Plancher de pixels par frame |
 | `MAX_NEW_TOKENS` | `800` | Longueur maximale de la complétion (surchargeable par `input.max_tokens`) |
+| `DISABLE_JSON_WHITESPACE` | `1` | Interdit les espaces libres dans le JSON contraint. **Ne pas désactiver** — voir Dépannage |
 | `ALLOW_HF_DOWNLOAD` | *(désactivé)* | `1` pour télécharger les poids depuis Hugging Face si le Model Cache est absent |
 | `MODEL_PATH` | *(vide)* | Chemin local de poids, prioritaire sur toute résolution de cache |
 | `GPU_MEMORY_UTILIZATION` | `0.90` | Part de la VRAM allouée à vLLM (poids + cache KV) |
@@ -520,7 +521,43 @@ ERROR CONFLIT CUDA COMPAT: ... la bibliotheque de compat est en 575.51.03, mais 
       VLLM_ENABLE_CUDA_COMPATIBILITY de l'image ou de l'endpoint.
 ```
 
-### `MODEL_OUTPUT_TRUNCATED` : le modèle boucle et tronque son JSON
+### `MODEL_OUTPUT_TRUNCATED` à *tous* les budgets : la boucle d'espaces
+
+**Le symptôme qui identifie ce cas** : la sortie utile est minuscule alors que le
+budget entier est consommé. Relevé le 2026-08-24, étape C :
+
+```
+raw_text : { "industry_code": "26010501"      <- 41 caractères
+tokens   : 1200 consommés, finish_reason=length
+```
+
+41 caractères pour 1200 jetons. Aucun texte français n'atteint ce ratio.
+
+**Cause.** La grammaire JSON de XGrammar autorise une quantité **arbitraire
+d'espaces** entre les jetons. Le modèle émet un préfixe valide, puis boucle sur
+des sauts de ligne jusqu'à épuiser `max_tokens`. C'est un bug vLLM connu
+([issue #19945](https://github.com/vllm-project/vllm/issues/19945)).
+
+Deux choses le rendaient invisible :
+
+- `completion.text.strip()` supprimait justement les espaces — d'où les 41
+  caractères restants ;
+- relever `max_tokens` ne corrige rien et **coûte plus cher** : chaque spot brûle
+  le nouveau plafond en espaces. Mesuré à **~15 c/spot contre 1,3 c** après être
+  passé de 1200 à 2400 jetons.
+
+**Correctif : `disable_any_whitespace=True`**, appliqué sur la **config du
+moteur**, pas sur `SamplingParams` — sur le moteur V1 le réglage par requête est
+ignoré silencieusement (même issue). Vérifier au démarrage :
+
+```
+Chargement de ... (…, disable_any_whitespace=True)
+```
+
+`usage.completion_chars` et `completion_chars_stripped` sont désormais remontés :
+un écart important entre les deux signale la boucle immédiatement.
+
+### `MODEL_OUTPUT_TRUNCATED` : boucle de répétition dans un champ libre
 
 Le modèle repète la même phrase dans un champ texte libre jusqu'à épuiser son
 budget de tokens ; le JSON n'est jamais refermé et devient illisible. Observé sur
