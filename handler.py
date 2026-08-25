@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 from urllib.parse import urlparse
 
+
 def _flag(name):
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
