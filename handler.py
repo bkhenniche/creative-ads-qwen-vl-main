@@ -77,11 +77,19 @@ VIDEO_SUFFIXES = {
 # d'origine, uniquement pour reproduire le bug.
 _NO_WS = os.environ.get("DISABLE_JSON_WHITESPACE", "1").strip().lower() not in (
     "0", "false", "no", "off")
+# Le backend doit etre nomme explicitement. StructuredOutputsConfig part sur
+# backend="auto" et son validateur refuse la combinaison:
+#   ValueError: disable_any_whitespace is only supported for xgrammar and
+#   guidance backends.
+# Cet objet est construit au chargement du module: avec "auto" le worker meurt
+# a l'import, avant la moindre ligne de log, et RunPod le redemarre en boucle.
+_SO_BACKEND = "xgrammar"
 if StructuredOutputsConfig is not None:
     STRUCTURED_OUTPUTS_CONFIG = StructuredOutputsConfig(
-        disable_any_whitespace=_NO_WS)
+        backend=_SO_BACKEND, disable_any_whitespace=_NO_WS)
 else:
-    STRUCTURED_OUTPUTS_CONFIG = {"disable_any_whitespace": _NO_WS}
+    STRUCTURED_OUTPUTS_CONFIG = {"backend": _SO_BACKEND,
+                                 "disable_any_whitespace": _NO_WS}
 
 ENGINE = None
 PROCESSOR = None
